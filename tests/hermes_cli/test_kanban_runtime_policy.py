@@ -256,6 +256,82 @@ def test_dispatch_refuses_untrusted_snapshot_state(
     assert policy.get_runtime_provider() is None
 
 
+def _create_legacy_review_rows(conn, count: int) -> None:
+    for index in range(count):
+        task_id = kb.create_task(conn, title=f"legacy review {index}")
+        assert kb.request_review(conn, task_id) is True
+
+
+def _create_governed_review_rows(conn, tmp_path: Path, count: int) -> None:
+    for index in range(count):
+        contract = _contract(
+            tmp_path / f"governed-review-{index}",
+            seat=f"review-producer-{index}",
+            write_set=[f"src/review-{index}"],
+        )
+        task_id = _create_governed(conn, contract, title=f"governed review {index}")
+        assert kb.request_review(conn, task_id, reviewer=f"review-verifier-{index}") is True
+
+
+def test_dispatch_counts_six_legacy_review_rows_for_backpressure(
+    conn, tmp_path, monkeypatch,
+):
+    _create_legacy_review_rows(conn, 6)
+    task_id = _create_governed(
+        conn, _contract(tmp_path, seat="candidate"), title="candidate producer",
+    )
+    monkeypatch.setattr(
+        kbd, "_profile_exists_fn", lambda: lambda seat: seat == "candidate",
+    )
+
+    result = kbd.dispatch_once(
+        conn,
+        spawn_fn=lambda _task, _workspace: pytest.fail("backpressured task must not spawn"),
+        runtime_policy_provider=_trusted_snapshot,
+    )
+
+    assert result.spawned == []
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert _latest_event(conn, task_id, "claim_rejected").payload["code"] == (
+        "unverified_queue_backpressure"
+    )
+
+
+@pytest.mark.parametrize(
+    ("legacy_count", "governed_count", "allowed"),
+    [(3, 2, True), (3, 3, False)],
+)
+def test_dispatch_counts_mixed_review_rows_at_backpressure_boundary(
+    conn, tmp_path, monkeypatch, legacy_count, governed_count, allowed,
+):
+    _create_legacy_review_rows(conn, legacy_count)
+    _create_governed_review_rows(conn, tmp_path, governed_count)
+    task_id = _create_governed(
+        conn,
+        _contract(tmp_path / "candidate", seat="candidate", write_set=["src/candidate"]),
+        title="boundary candidate",
+    )
+    monkeypatch.setattr(
+        kbd, "_profile_exists_fn", lambda: lambda seat: seat == "candidate",
+    )
+
+    result = kbd.dispatch_once(
+        conn,
+        spawn_fn=lambda _task, _workspace: None,
+        runtime_policy_provider=_trusted_snapshot,
+    )
+
+    if allowed:
+        assert [item[0] for item in result.spawned] == [task_id]
+        assert kb.get_task(conn, task_id).status == "running"
+    else:
+        assert result.spawned == []
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert _latest_event(conn, task_id, "claim_rejected").payload["code"] == (
+            "unverified_queue_backpressure"
+        )
+
+
 def test_review_claim_enforces_the_verifier_floor(conn, tmp_path):
     contract = _contract(tmp_path)
     task_id = _create_governed(conn, contract, title="verify")

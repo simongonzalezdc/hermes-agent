@@ -125,7 +125,9 @@ def _queue_runtime(conn: sqlite3.Connection, task: dict[str, Any]) -> dict[str, 
     counts.setdefault(task["seat"], 0)
 
     active_write_sets: list[dict[str, Any]] = []
-    unverified_depth = 0
+    unverified_depth = int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
+    ).fetchone()[0])
     rows = conn.execute(
         "SELECT id, status, admission_policy, creation_admission_policy FROM tasks "
         "WHERE status IN ('running', 'review') "
@@ -140,8 +142,6 @@ def _queue_runtime(conn: sqlite3.Connection, task: dict[str, Any]) -> dict[str, 
                 "invalid_queue_runtime",
                 f"governed task {row['id']} has invalid lifecycle policy: {lifecycle_error}",
             )
-        if row["status"] == "review" or active["role"] == "verifier":
-            unverified_depth += 1
         if row["status"] == "running":
             active_write_sets.append({
                 "task_id": row["id"],
