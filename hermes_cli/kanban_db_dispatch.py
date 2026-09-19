@@ -1927,24 +1927,36 @@ def dispatch_once(
     so two dispatchers on one ``kanban.db`` never race a write tick on WAL
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
-    resolved DB path so unrelated boards tick in parallel.
+    resolved DB path so unrelated boards tick in parallel.  When supplied,
+    ``runtime_policy_provider`` is an owner-controlled fresh snapshot reader;
+    its adapted provider exists only for this tick's claim calls.
     """
     def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-            runtime_policy_provider=runtime_policy_provider,
-        )
+        def _run() -> DispatchResult:
+            return _dispatch_once_locked(
+                conn,
+                spawn_fn=spawn_fn,
+                ttl_seconds=ttl_seconds,
+                dry_run=dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=failure_limit,
+                stale_timeout_seconds=stale_timeout_seconds,
+                board=board,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans,
+                runtime_policy_provider=None,
+            )
+
+        if runtime_policy_provider is None:
+            return _run()
+        from hermes_cli.kanban_runtime_adapter import build_trusted_runtime_provider
+        from hermes_cli.kanban_runtime_policy import runtime_provider_scope
+
+        provider = build_trusted_runtime_provider(conn, runtime_policy_provider)
+        with runtime_provider_scope(provider):
+            return _run()
 
     try:
         db_path = _kb.kanban_db_path(board=board)

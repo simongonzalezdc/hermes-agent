@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -12,6 +15,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime_policy as policy
+from hermes_cli.kanban_runtime_adapter import TRUSTED_RUNTIME_SCHEMA
 
 
 @pytest.fixture
@@ -98,6 +102,27 @@ def _runtime(task: dict, *, capabilities: list[str] | None = None) -> dict:
     }
 
 
+def _trusted_snapshot(task: dict, *, observed_at: int | None = None) -> dict:
+    now = int(time.time()) if observed_at is None else observed_at
+    runtime = _runtime(task)
+    for field in (
+        "dispatcher_tasks", "unverified_queue_depth", "in_flight_by_seat",
+        "active_write_sets",
+    ):
+        runtime.pop(field)
+    return {
+        "schema": TRUSTED_RUNTIME_SCHEMA,
+        "identity": {
+            "provider": "owner-runtime-reader/v1",
+            "task_id": task["task_id"],
+            "lease_id": f"lease:{task['task_id']}",
+        },
+        "observed_at": now,
+        "lease_expires_at": now + 30,
+        "runtime": runtime,
+    }
+
+
 def _latest_event(conn, task_id: str, kind: str):
     return [event for event in kb.list_events(conn, task_id) if event.kind == kind][-1]
 
@@ -134,14 +159,101 @@ def test_creation_policy_marker_prevents_claim_downgrade(conn, tmp_path, active_
     assert kb.get_task(conn, task_id).status == "ready"
 
 
-def test_registered_adapter_reaches_the_standard_dispatch_claim_path(conn, tmp_path, monkeypatch):
-    monkeypatch.setattr(policy, "_runtime_provider", None)
-    policy.register_runtime_provider(_runtime)
-    policy.register_runtime_provider(_runtime)
-    with pytest.raises(RuntimeError, match="already registered"):
-        policy.register_runtime_provider(lambda task: _runtime(task))
+def test_registered_adapter_reaches_the_standard_dispatch_claim_path(conn, tmp_path):
     task_id = _create_governed(conn, _contract(tmp_path), title="registered adapter")
-    assert kb.claim_task(conn, task_id) is not None
+    assert policy.get_runtime_provider() is None
+    with policy.runtime_provider_scope(_runtime):
+        assert policy.get_runtime_provider() is _runtime
+        assert kb.claim_task(conn, task_id) is not None
+    assert policy.get_runtime_provider() is None
+
+
+def test_dispatch_registers_fresh_snapshot_only_for_its_tick(conn, tmp_path, monkeypatch):
+    task_id = _create_governed(conn, _contract(tmp_path), title="fresh runtime")
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    preceding_provider = lambda task: _runtime(task)
+
+    with policy.runtime_provider_scope(preceding_provider):
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+            runtime_policy_provider=_trusted_snapshot,
+        )
+        assert policy.get_runtime_provider() is preceding_provider
+
+    assert [item[0] for item in result.spawned] == [task_id]
+    assert kb.get_task(conn, task_id).status == "running"
+    assert policy.get_runtime_provider() is None
+
+    later = _create_governed(
+        conn, _contract(tmp_path / "later", seat="later-builder"), title="later",
+    )
+    assert kb.claim_task(conn, later) is None
+    assert _latest_event(conn, later, "claim_rejected").payload["code"] == "missing_trusted_runtime"
+
+
+def test_runtime_provider_scopes_do_not_cross_concurrent_dispatch_contexts():
+    barrier = threading.Barrier(2)
+    providers = [lambda task: {"provider": "one"}, lambda task: {"provider": "two"}]
+
+    def probe(provider):
+        assert policy.get_runtime_provider() is None
+        with policy.runtime_provider_scope(provider):
+            barrier.wait(timeout=5)
+            current = policy.get_runtime_provider()
+            barrier.wait(timeout=5)
+        return current is provider and policy.get_runtime_provider() is None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert all(executor.map(probe, providers))
+    assert policy.get_runtime_provider() is None
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_code"),
+    [
+        (
+            lambda snapshot, _task: snapshot.update(
+                observed_at=int(time.time()) - 31,
+                lease_expires_at=int(time.time()) + 1,
+            ),
+            "stale_trusted_runtime",
+        ),
+        (
+            lambda snapshot, _task: snapshot["runtime"].pop("engine_lane"),
+            "malformed_trusted_runtime",
+        ),
+        (
+            lambda snapshot, _task: snapshot["identity"].update(task_id="other-task"),
+            "trusted_runtime_identity_mismatch",
+        ),
+        (
+            lambda snapshot, _task: snapshot["runtime"].update(in_flight_by_seat={}),
+            "trusted_runtime_derived_field",
+        ),
+    ],
+)
+def test_dispatch_refuses_untrusted_snapshot_state(
+    conn, tmp_path, monkeypatch, mutate, expected_code,
+):
+    task_id = _create_governed(conn, _contract(tmp_path), title=expected_code)
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+
+    def reader(task):
+        snapshot = _trusted_snapshot(task)
+        mutate(snapshot, task)
+        return snapshot
+
+    result = kbd.dispatch_once(
+        conn,
+        spawn_fn=lambda _task, _workspace: pytest.fail("denied task must not spawn"),
+        runtime_policy_provider=reader,
+    )
+
+    assert result.spawned == []
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert _latest_event(conn, task_id, "claim_rejected").payload["code"] == expected_code
+    assert policy.get_runtime_provider() is None
 
 
 def test_review_claim_enforces_the_verifier_floor(conn, tmp_path):

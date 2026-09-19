@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlparse
@@ -37,26 +39,43 @@ RECEIPT_FIELDS = {
 VERIFIER_FIELDS = {"identity", "result", "evidence"}
 TERMINAL_DISPOSITIONS = {"passed", "failed", "blocked", "cancelled"}
 RuntimeProvider = Callable[[dict[str, Any]], Mapping[str, Any]]
-_runtime_provider: Optional[RuntimeProvider] = None
+_runtime_provider: ContextVar[Optional[RuntimeProvider]] = ContextVar(
+    "kanban_runtime_provider", default=None,
+)
 
 
-def register_runtime_provider(provider: RuntimeProvider) -> None:
-    """Register the process-wide trusted snapshot adapter exactly once.
+class RuntimeSnapshotError(ValueError):
+    """A trusted reader returned state that cannot authorize a claim."""
 
-    A standalone plugin can call this during startup.  Replacing a live
-    provider would change admission authority underneath the dispatcher, so a
-    second distinct registration is refused.
-    """
-    global _runtime_provider
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+def register_runtime_provider(provider: RuntimeProvider) -> Token:
+    """Register a trusted snapshot adapter in the current execution context."""
     if not callable(provider):
         raise TypeError("runtime policy provider must be callable")
-    if _runtime_provider is not None and _runtime_provider is not provider:
-        raise RuntimeError("runtime policy provider is already registered")
-    _runtime_provider = provider
+    return _runtime_provider.set(provider)
+
+
+def unregister_runtime_provider(token: Token) -> None:
+    """Restore the provider that preceded ``register_runtime_provider``."""
+    _runtime_provider.reset(token)
+
+
+@contextmanager
+def runtime_provider_scope(provider: RuntimeProvider):
+    """Keep claim authority local to one dispatcher request/tick."""
+    token = register_runtime_provider(provider)
+    try:
+        yield
+    finally:
+        unregister_runtime_provider(token)
 
 
 def get_runtime_provider() -> Optional[RuntimeProvider]:
-    return _runtime_provider
+    return _runtime_provider.get()
 
 
 def _nonempty(value: Any) -> bool:
@@ -423,6 +442,8 @@ def assess_claim(
         return _deny("missing_trusted_runtime", "governed claims require a trusted runtime provider")
     try:
         runtime = runtime_provider(dict(task))
+    except RuntimeSnapshotError as exc:
+        return _deny(exc.code, str(exc))
     except Exception as exc:
         return _deny("runtime_provider_failed", f"trusted runtime provider failed: {type(exc).__name__}")
     assessment = evaluate(task, runtime)
