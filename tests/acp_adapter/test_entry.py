@@ -1,11 +1,96 @@
 """Tests for acp_adapter.entry startup wiring."""
 
+import os
 import sys
 
 import acp
 import pytest
 
 from acp_adapter import entry
+
+
+def _write_approval_config(home, mode):
+    home.mkdir()
+    (home / "config.yaml").write_text(f"approvals:\n  mode: {mode}\n", encoding="utf-8")
+
+
+def test_check_binds_explicit_hermes_home_before_config_load(tmp_path, monkeypatch):
+    home = tmp_path / "seat-a"
+    home.mkdir()
+    seen = {}
+
+    monkeypatch.setattr(
+        entry,
+        "_run_check",
+        lambda: seen.update(home=os.environ.get("HERMES_HOME"), check=True),
+    )
+
+    entry.main(["--check", "--hermes-home", str(home)])
+
+    assert seen == {"home": str(home.resolve()), "check": True}
+
+
+@pytest.mark.parametrize("mode", ["manual", "smart", "off"])
+def test_check_accepts_explicit_matching_approval_mode(tmp_path, monkeypatch, mode):
+    home = tmp_path / mode
+    _write_approval_config(home, mode)
+    checked = []
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry, "_run_check", lambda: checked.append(True))
+
+    entry.main([
+        "--check", "--hermes-home", str(home), "--require-approval-mode", mode,
+    ])
+
+    assert checked == [True]
+
+
+def test_required_approval_mode_refuses_mismatch(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "seat-a"
+    _write_approval_config(home, "smart")
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry, "_run_check", lambda: pytest.fail("check must not run"))
+
+    with pytest.raises(SystemExit, match="2"):
+        entry.main([
+            "--check", "--hermes-home", str(home), "--require-approval-mode", "manual",
+        ])
+
+    assert "required manual, effective smart" in capsys.readouterr().err
+
+
+def test_required_approval_mode_refuses_implicit_default(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "seat-a"
+    home.mkdir()
+    (home / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+
+    with pytest.raises(SystemExit, match="2"):
+        entry.main([
+            "--check", "--hermes-home", str(home), "--require-approval-mode", "smart",
+        ])
+
+    assert "must explicitly set approvals.mode" in capsys.readouterr().err
+
+
+def test_required_approval_mode_requires_explicit_home():
+    with pytest.raises(SystemExit, match="2"):
+        entry.main(["--check", "--require-approval-mode", "manual"])
+
+
+def test_explicit_hermes_home_must_be_absolute(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit, match="2"):
+        entry.main(["--check", "--hermes-home", "seat-a"])
+
+    assert "must be an absolute path" in capsys.readouterr().err
 
 
 def test_main_enables_unstable_protocol(monkeypatch):

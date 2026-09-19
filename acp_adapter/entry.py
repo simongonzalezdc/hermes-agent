@@ -86,6 +86,16 @@ def _load_env() -> None:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="hermes-acp", description="Run Hermes Agent as an ACP stdio server.")
+    parser.add_argument(
+        "--hermes-home",
+        type=Path,
+        help="Use this explicit Hermes home for config, credentials, and state",
+    )
+    parser.add_argument(
+        "--require-approval-mode",
+        choices=("manual", "smart", "off"),
+        help="Refuse startup unless the explicit Hermes home has this effective approvals.mode",
+    )
     parser.add_argument("--version", action="store_true", help="Print Hermes version and exit")
     parser.add_argument("--check", action="store_true", help="Verify ACP dependencies and adapter imports, then exit")
     parser.add_argument("--setup", action="store_true",
@@ -96,7 +106,60 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
                         help="Accept all prompts (currently used by --setup-browser to skip the "
                              "~400 MB Chromium download confirmation).")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.require_approval_mode and args.hermes_home is None:
+        parser.error("--require-approval-mode requires --hermes-home")
+    if args.require_approval_mode and (args.version or args.setup or args.setup_browser):
+        parser.error("--require-approval-mode may only be used for ACP startup or --check")
+    return args
+
+
+def _bind_hermes_home(path: Path | None) -> None:
+    """Bind a supervisor-selected home before any config-dependent imports."""
+    if path is None:
+        return
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise ValueError("--hermes-home must be an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"--hermes-home is not accessible: {path}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"--hermes-home is not a directory: {resolved}")
+    os.environ["HERMES_HOME"] = str(resolved)
+
+
+def _require_approval_mode(expected: str | None) -> None:
+    """Fail closed unless the selected home's explicit and effective mode matches."""
+    if expected is None:
+        return
+
+    from hermes_cli.config import load_config_readonly, read_user_config_raw
+    from tools.approval_context import _normalize_approval_mode
+
+    config_path = get_hermes_home() / "config.yaml"
+    try:
+        raw = read_user_config_raw(config_path)
+    except Exception as exc:
+        raise ValueError(f"cannot read governed ACP config {config_path}: {exc}") from exc
+    raw_approvals = raw.get("approvals") if isinstance(raw, dict) else None
+    if not isinstance(raw_approvals, dict) or "mode" not in raw_approvals:
+        raise ValueError(f"governed ACP config must explicitly set approvals.mode in {config_path}")
+
+    try:
+        effective = load_config_readonly()
+    except Exception as exc:
+        raise ValueError(f"cannot load governed ACP config {config_path}: {exc}") from exc
+    approvals = effective.get("approvals") if isinstance(effective, dict) else None
+    if not isinstance(approvals, dict):
+        raise ValueError(f"governed ACP config has no effective approvals mapping in {config_path}")
+    actual = _normalize_approval_mode(approvals.get("mode"))
+    if actual != expected:
+        raise ValueError(
+            f"governed ACP approval mode mismatch for {config_path}: "
+            f"required {expected}, effective {actual}"
+        )
 
 
 def _print_version() -> None:
@@ -168,16 +231,33 @@ def _warm_memory_provider_import(logger: logging.Logger) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
     args = _parse_args(argv)
-    for flag, action in (("version", _print_version), ("check", _run_check), ("setup", _run_setup)):
+    try:
+        _bind_hermes_home(args.hermes_home)
+    except ValueError as exc:
+        print(f"hermes-acp: error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    for flag, action in (("version", _print_version), ("setup", _run_setup)):
         if getattr(args, flag):
             return action()
     if args.setup_browser:
         if rc := _run_setup_browser(assume_yes=args.assume_yes):
             sys.exit(rc)
         return
+    if args.check and args.require_approval_mode is None:
+        return _run_check()
 
     _setup_logging()
     _load_env()
+
+    try:
+        _require_approval_mode(args.require_approval_mode)
+    except ValueError as exc:
+        print(f"hermes-acp: error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if args.check:
+        return _run_check()
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")
