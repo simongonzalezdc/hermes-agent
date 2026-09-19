@@ -33,6 +33,7 @@ from hermes_constants import get_hermes_home
 # (clients treat that as "agent alive"), but the dispatching supervisor task also logs
 # ``"Background task failed"`` with a traceback every probe. Keep the response; silence the noise.
 _BENIGN_PROBE_METHODS = frozenset({"ping", "health", "healthcheck"})
+_APPROVAL_MODES = ("manual", "smart", "off")
 
 
 class _BenignProbeMethodFilter(logging.Filter):
@@ -93,7 +94,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-approval-mode",
-        choices=("manual", "smart", "off"),
+        choices=_APPROVAL_MODES,
         help="Refuse startup unless the explicit Hermes home has this effective approvals.mode",
     )
     parser.add_argument("--version", action="store_true", help="Print Hermes version and exit")
@@ -146,7 +147,16 @@ def _require_approval_mode(expected: str | None) -> None:
     raw_approvals = raw.get("approvals") if isinstance(raw, dict) else None
     if not isinstance(raw_approvals, dict) or "mode" not in raw_approvals:
         raise ValueError(f"governed ACP config must explicitly set approvals.mode in {config_path}")
-
+    raw_mode = raw_approvals["mode"]
+    # PyYAML's YAML 1.1 resolver parses an unquoted ``off`` as False.
+    raw_mode_is_supported = raw_mode is False or (
+        isinstance(raw_mode, str) and raw_mode.strip().lower() in _APPROVAL_MODES
+    )
+    if not raw_mode_is_supported:
+        raise ValueError(
+            f"governed ACP config has unsupported approvals.mode {raw_mode!r} in {config_path}; "
+            f"expected one of {', '.join(_APPROVAL_MODES)}"
+        )
     try:
         effective = load_config_readonly()
     except Exception as exc:
@@ -160,6 +170,16 @@ def _require_approval_mode(expected: str | None) -> None:
             f"governed ACP approval mode mismatch for {config_path}: "
             f"required {expected}, effective {actual}"
         )
+    if expected != "off":
+        # Import after the selected home's dotenv is loaded so process-scoped
+        # HERMES_YOLO_MODE is frozen from the governed seat, not the launcher.
+        from tools.approval import is_approval_bypass_active
+
+        if is_approval_bypass_active():
+            raise ValueError(
+                f"governed ACP approval bypass is active for {config_path}; "
+                f"{expected} mode requires process and session bypasses to be disabled"
+            )
 
 
 def _print_version() -> None:

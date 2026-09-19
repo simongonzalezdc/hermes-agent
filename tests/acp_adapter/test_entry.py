@@ -1,7 +1,9 @@
 """Tests for acp_adapter.entry startup wiring."""
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import acp
 import pytest
@@ -32,6 +34,8 @@ def test_check_binds_explicit_hermes_home_before_config_load(tmp_path, monkeypat
 
 @pytest.mark.parametrize("mode", ["manual", "smart", "off"])
 def test_check_accepts_explicit_matching_approval_mode(tmp_path, monkeypatch, mode):
+    from tools import approval
+
     home = tmp_path / mode
     _write_approval_config(home, mode)
     checked = []
@@ -39,6 +43,7 @@ def test_check_accepts_explicit_matching_approval_mode(tmp_path, monkeypatch, mo
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
     monkeypatch.setattr(entry, "_load_env", lambda: None)
     monkeypatch.setattr(entry, "_run_check", lambda: checked.append(True))
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
 
     entry.main([
         "--check", "--hermes-home", str(home), "--require-approval-mode", mode,
@@ -77,6 +82,77 @@ def test_required_approval_mode_refuses_implicit_default(tmp_path, monkeypatch, 
         ])
 
     assert "must explicitly set approvals.mode" in capsys.readouterr().err
+
+
+def test_required_approval_mode_refuses_unknown_raw_value(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "seat-a"
+    _write_approval_config(home, "banana")
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry, "_run_check", lambda: pytest.fail("check must not run"))
+
+    with pytest.raises(SystemExit, match="2"):
+        entry.main([
+            "--check", "--hermes-home", str(home), "--require-approval-mode", "manual",
+        ])
+
+    assert "unsupported approvals.mode 'banana'" in capsys.readouterr().err
+
+
+def test_required_manual_mode_refuses_seat_dotenv_yolo(tmp_path):
+    home = tmp_path / "seat-a"
+    _write_approval_config(home, "manual")
+    (home / ".env").write_text("HERMES_YOLO_MODE=1\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("HERMES_YOLO_MODE", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "acp_adapter.entry",
+            "--check",
+            "--hermes-home",
+            str(home),
+            "--require-approval-mode",
+            "manual",
+        ],
+        cwd=Path(entry.__file__).resolve().parent.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "governed ACP approval bypass is active" in completed.stderr
+
+
+def test_required_smart_mode_refuses_current_session_yolo(tmp_path, monkeypatch, capsys):
+    from tools import approval
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+
+    home = tmp_path / "seat-a"
+    _write_approval_config(home, "smart")
+    session_key = "governed-acp-test"
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry, "_run_check", lambda: pytest.fail("check must not run"))
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    token = set_current_session_key(session_key)
+    approval.enable_session_yolo(session_key)
+    try:
+        with pytest.raises(SystemExit, match="2"):
+            entry.main([
+                "--check", "--hermes-home", str(home), "--require-approval-mode", "smart",
+            ])
+    finally:
+        approval.clear_session(session_key)
+        reset_current_session_key(token)
+
+    assert "governed ACP approval bypass is active" in capsys.readouterr().err
 
 
 def test_required_approval_mode_requires_explicit_home():
