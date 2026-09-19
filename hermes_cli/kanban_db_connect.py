@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import random
 import re
 import secrets
@@ -832,6 +833,10 @@ _LATER_TASK_COLUMNS = (
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
     ("admission_policy", "admission_policy TEXT"),
+    # Immutable policy supplied when the task was created.  The active
+    # admission_policy moves to the verifier lane during review, while create
+    # idempotency must continue comparing the original producer request.
+    ("creation_admission_policy", "creation_admission_policy TEXT"),
     ("admission_lease", "admission_lease TEXT"),
     ("capabilities", "capabilities TEXT"),
     ("creator_task_id", "creator_task_id TEXT"),
@@ -872,6 +877,63 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def _backfill_creation_admission_policy(conn: sqlite3.Connection) -> None:
+    """Recover immutable producer policy for pre-column governed tasks.
+
+    Review transitions preserve the producer policy in ``review_requested``
+    events.  Producer-lane rows can use their still-active admission policy.
+    A verifier-lane row without either source stays NULL so idempotent create
+    retries fail closed instead of treating a review policy as the original.
+    """
+    rows = conn.execute(
+        "SELECT id, admission_policy FROM tasks "
+        "WHERE admission_policy IS NOT NULL AND creation_admission_policy IS NULL"
+    ).fetchall()
+    for row in rows:
+        producer_policy = None
+        events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC",
+            (row["id"],),
+        ).fetchall()
+        for event in events:
+            try:
+                payload = json.loads(event["payload"] or "null")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            candidate = (
+                payload.get("producer_admission_policy")
+                if isinstance(payload, dict) else None
+            )
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("role") != "verifier"
+                and candidate.get("queue_lane") == "ready"
+            ):
+                producer_policy = candidate
+                break
+
+        if producer_policy is None:
+            try:
+                active_policy = json.loads(row["admission_policy"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(active_policy, dict)
+                and active_policy.get("role") != "verifier"
+                and active_policy.get("queue_lane") == "ready"
+            ):
+                producer_policy = active_policy
+
+        if producer_policy is not None:
+            conn.execute(
+                "UPDATE tasks SET creation_admission_policy = ? "
+                "WHERE id = ? AND creation_admission_policy IS NULL",
+                (json.dumps(producer_policy, sort_keys=True), row["id"]),
+            )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
     cols = _column_names(conn, "tasks")
@@ -896,6 +958,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
+
+    _backfill_creation_admission_policy(conn)
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,

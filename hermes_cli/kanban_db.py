@@ -732,7 +732,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
-    admission_policy: Optional[dict] = None  # immutable dispatcher binding; NULL = legacy behaviour
+    admission_policy: Optional[dict] = None  # active dispatcher binding; NULL = legacy behaviour
+    creation_admission_policy: Optional[dict] = None  # immutable producer binding for create retries
     capabilities: Optional[list] = None      # governed worker toolsets; NULL = profile defaults
     creator_task_id: Optional[str] = None    # durable delegation lineage
 
@@ -757,6 +758,7 @@ class Task:
             skills=skills_value,
             capabilities=capabilities_value,
             admission_policy=_json_or(g("admission_policy")),
+            creation_admission_policy=_json_or(g("creation_admission_policy")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -1280,29 +1282,30 @@ def _matching_idempotent_task(
     if not idempotency_key:
         return None
     row = conn.execute(
-        "SELECT id, admission_policy, assignee, workspace_path, capabilities, "
-        "model_override, provider_override FROM tasks WHERE idempotency_key = ? "
+        "SELECT id, admission_policy, creation_admission_policy "
+        "FROM tasks WHERE idempotency_key = ? "
         "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
         (idempotency_key,),
     ).fetchone()
     if row is None:
         return None
-    existing_raw = row["admission_policy"]
-    if existing_raw is None and admission_policy is None:
+    active_raw = row["admission_policy"]
+    creation_raw = row["creation_admission_policy"]
+    existing_governed = active_raw is not None or creation_raw is not None
+    if not existing_governed and admission_policy is None:
         return row["id"]
-    if existing_raw is None or admission_policy is None:
+    if not existing_governed or admission_policy is None:
         raise ValueError("idempotency key policy mismatch: governed and legacy tasks cannot alias")
-    from hermes_cli.kanban_runtime_policy import canonical_binding_error, validate_contract
+    if creation_raw is None:
+        raise ValueError("idempotency key resolves to a governed task without immutable creation policy")
+    from hermes_cli.kanban_runtime_policy import validate_contract
 
     try:
-        existing = validate_contract(json.loads(existing_raw))
+        existing = validate_contract(json.loads(creation_raw))
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("idempotency key resolves to an invalid governed task") from exc
     if existing != admission_policy:
         raise ValueError("idempotency key admission_policy mismatch")
-    binding_error = canonical_binding_error(existing, row)
-    if binding_error:
-        raise ValueError("idempotency key canonical binding mismatch: " + binding_error)
     return row["id"]
 
 
@@ -1450,8 +1453,8 @@ def create_task(
                         skills, capabilities, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        admission_policy, creator_task_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        admission_policy, creation_admission_policy, creator_task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1462,6 +1465,7 @@ def create_task(
                         json.dumps(capabilities_list) if capabilities_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        json.dumps(admission_policy, sort_keys=True) if admission_policy is not None else None,
                         json.dumps(admission_policy, sort_keys=True) if admission_policy is not None else None,
                         creator_task_id,
                     ),

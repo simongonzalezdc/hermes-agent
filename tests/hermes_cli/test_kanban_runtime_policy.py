@@ -290,6 +290,62 @@ def test_idempotent_governed_create_never_aliases_policy_mismatch(conn, tmp_path
         kb.create_task(conn, title="legacy retry", idempotency_key=governed_key)
 
 
+def test_exact_governed_create_retry_stays_idempotent_during_review(conn, tmp_path):
+    key = "review-retry"
+    contract = _contract(tmp_path)
+    task_id = _create_governed(conn, contract, idempotency_key=key)
+
+    assert kb.request_review(conn, task_id, reviewer="verifier-1") is True
+    reviewing = kb.get_task(conn, task_id)
+    assert reviewing.status == "review"
+    assert reviewing.admission_policy["role"] == "verifier"
+    assert reviewing.creation_admission_policy == contract
+
+    assert _create_governed(conn, contract, idempotency_key=key) == task_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,),
+    ).fetchone()[0] == 1
+
+
+def test_exact_governed_create_retry_stays_idempotent_after_done(conn, tmp_path):
+    key = "done-retry"
+    contract = _contract(tmp_path)
+    task_id = _create_governed(conn, contract, idempotency_key=key)
+    assert kb.request_review(conn, task_id, reviewer="verifier-1") is True
+    reviewed = kb.claim_review_task(conn, task_id, runtime_policy_provider=_runtime)
+    assert reviewed is not None
+    assert kb.complete_task(
+        conn, task_id, expected_run_id=reviewed.current_run_id,
+    ) is True
+
+    completed = kb.get_task(conn, task_id)
+    assert completed.status == "done"
+    assert completed.admission_policy["role"] == "verifier"
+    assert completed.creation_admission_policy == contract
+    assert _create_governed(conn, contract, idempotency_key=key) == task_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,),
+    ).fetchone()[0] == 1
+
+
+def test_migration_recovers_creation_policy_from_review_event(conn, tmp_path):
+    key = "migrated-review-retry"
+    contract = _contract(tmp_path)
+    task_id = _create_governed(conn, contract, idempotency_key=key)
+    assert kb.request_review(conn, task_id, reviewer="verifier-1") is True
+
+    # Simulate a governed row written before creation_admission_policy existed.
+    conn.execute(
+        "UPDATE tasks SET creation_admission_policy = NULL WHERE id = ?", (task_id,),
+    )
+    kbc._migrate_add_optional_columns(conn)
+
+    migrated = kb.get_task(conn, task_id)
+    assert migrated.admission_policy["role"] == "verifier"
+    assert migrated.creation_admission_policy == contract
+    assert _create_governed(conn, contract, idempotency_key=key) == task_id
+
+
 def test_delegation_policy_binds_to_canonical_creator_and_verifier(conn, tmp_path):
     parent = kb.create_task(conn, title="parent")
     other_parent = kb.create_task(conn, title="other parent")

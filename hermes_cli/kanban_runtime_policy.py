@@ -1,10 +1,11 @@
 """Fail-closed policy checks for governed Kanban claims and delegation receipts.
 
 The Kanban database remains the queue and single writer.  A governed task
-stores its immutable dispatcher binding in ``tasks.admission_policy``; the
-dispatcher supplies a fresh trusted runtime snapshot while ``claim_task`` holds
-the existing ``BEGIN IMMEDIATE`` transaction.  Ungoverned tasks keep their
-historic claim behaviour.
+stores its active dispatcher binding in ``tasks.admission_policy`` and its
+immutable producer binding in ``tasks.creation_admission_policy``.  The
+dispatcher supplies a fresh trusted runtime snapshot while ``claim_task``
+holds the existing ``BEGIN IMMEDIATE`` transaction.  Ungoverned tasks keep
+their historic claim behaviour.
 """
 
 from __future__ import annotations
