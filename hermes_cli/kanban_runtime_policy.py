@@ -236,8 +236,15 @@ def evaluate(task: Any, runtime: Any) -> dict[str, Any]:
     """Evaluate a governed task against a trusted, current runtime snapshot."""
     if not isinstance(task, dict) or not isinstance(runtime, Mapping):
         return _deny("invalid_input", "task and runtime must be objects")
-    if not _nonempty(task.get("task_id")):
+    task = dict(task)
+    task_id = task.pop("task_id", None)
+    if not _nonempty(task_id):
         return _deny("missing_dispatcher_task_id", "dispatcher-issued task_id is required")
+    try:
+        task = validate_contract(task)
+    except ValueError as exc:
+        return _deny("invalid_admission_policy", str(exc))
+    task["task_id"] = task_id
     binding_error = _dispatcher_binding_error(task, runtime)
     if binding_error:
         return _deny("invalid_dispatcher_binding", binding_error)
@@ -288,7 +295,7 @@ def evaluate(task: Any, runtime: Any) -> dict[str, Any]:
     if depth > MAX_UNVERIFIED and role != "verifier":
         return _deny("unverified_queue_backpressure", "unverified queue depth exceeds the producer limit", approval=approval)
     in_flight = runtime.get("in_flight_by_seat")
-    seat_count = in_flight.get(task["seat"], 0) if isinstance(in_flight, dict) else None
+    seat_count = in_flight.get(task["seat"]) if isinstance(in_flight, dict) else None
     if not isinstance(seat_count, int) or isinstance(seat_count, bool) or seat_count < 0:
         return _deny("unknown_in_flight", "trusted in-flight counts are required", approval=approval)
     if seat_count >= 1:
@@ -353,16 +360,21 @@ def assess_claim(
     the stale-snapshot race for one-seat and overlapping-write-set claims.
     """
     row = conn.execute(
-        "SELECT admission_policy, assignee, workspace_path, capabilities, "
-        "model_override, provider_override FROM tasks WHERE id = ?", (task_id,),
+        "SELECT admission_policy, creation_admission_policy, assignee, "
+        "workspace_path, capabilities, model_override, provider_override "
+        "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    raw = row["admission_policy"] if row else None
-    if not raw:
+    if row is None:
         return None
+    raw = row["admission_policy"]
+    if raw is None and row["creation_admission_policy"] is None:
+        return None
+    if raw is None:
+        return _deny("invalid_admission_policy", "governed task is missing its active admission_policy")
     try:
         task = json.loads(raw)
         task = validate_contract(task)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
         return _deny("invalid_admission_policy", str(exc))
     binding_error = canonical_binding_error(task, row)
     if binding_error:
@@ -386,12 +398,13 @@ def assess_claim(
         return _deny("invalid_write_scope", scope)
     for active in conn.execute(
         "SELECT id, admission_policy FROM tasks "
-        "WHERE status = 'running' AND id != ? AND admission_policy IS NOT NULL",
+        "WHERE status = 'running' AND id != ? "
+        "AND (admission_policy IS NOT NULL OR creation_admission_policy IS NOT NULL)",
         (task_id,),
     ):
         try:
             other = validate_contract(json.loads(active["admission_policy"]))
-        except (json.JSONDecodeError, ValueError):
+        except (TypeError, json.JSONDecodeError, ValueError):
             return _deny("invalid_active_admission_policy", f"running task {active['id']} has invalid policy")
         if other["seat"] == task["seat"]:
             return _deny("seat_already_in_flight", "seat already has a canonical running task")
@@ -450,15 +463,19 @@ def validate_completion_receipt(
 ) -> list[str]:
     """Validate a governed child receipt against its immutable task binding."""
     row = conn.execute(
-        "SELECT admission_policy, creator_task_id, current_run_id "
+        "SELECT admission_policy, creation_admission_policy, creator_task_id, current_run_id "
         "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    raw = row["admission_policy"] if row else None
-    if not raw:
+    if row is None:
         return []
+    raw = row["admission_policy"]
+    if raw is None and row["creation_admission_policy"] is None:
+        return []
+    if raw is None:
+        return ["governed task is missing its active admission_policy"]
     try:
         contract = validate_contract(json.loads(raw))
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
         return [f"invalid admission_policy: {exc}"]
     parent_id = contract.get("parent_task_id")
     if parent_id is None:
@@ -518,13 +535,15 @@ def prepare_policy_rollback(conn: sqlite3.Connection) -> list[str]:
     fenced: list[str] = []
     with write_txn(conn):
         running = [row["id"] for row in conn.execute(
-            "SELECT id FROM tasks WHERE admission_policy IS NOT NULL "
+            "SELECT id FROM tasks WHERE "
+            "(admission_policy IS NOT NULL OR creation_admission_policy IS NOT NULL) "
             "AND status = 'running' ORDER BY id"
         )]
         if running:
             raise RuntimeError("drain governed running tasks before rollback: " + ", ".join(running))
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE admission_policy IS NOT NULL "
+            "SELECT id FROM tasks WHERE "
+            "(admission_policy IS NOT NULL OR creation_admission_policy IS NOT NULL) "
             "AND status IN ('triage', 'todo', 'scheduled', 'ready', 'review') ORDER BY id"
         ).fetchall()
         for row in rows:

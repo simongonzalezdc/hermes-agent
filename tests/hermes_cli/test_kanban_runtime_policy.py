@@ -121,6 +121,19 @@ def test_governed_claim_requires_runtime_and_records_admission(conn, tmp_path):
     assert event.payload["approval"] == {"role": "seat", "floor": 2, "hermes_mode": "manual"}
 
 
+@pytest.mark.parametrize("active_policy", [None, ""])
+def test_creation_policy_marker_prevents_claim_downgrade(conn, tmp_path, active_policy):
+    task_id = _create_governed(conn, _contract(tmp_path))
+    conn.execute(
+        "UPDATE tasks SET admission_policy = ? WHERE id = ?", (active_policy, task_id),
+    )
+
+    assert kb.claim_task(conn, task_id, runtime_policy_provider=_runtime) is None
+    rejected = _latest_event(conn, task_id, "claim_rejected")
+    assert rejected.payload["code"] == "invalid_admission_policy"
+    assert kb.get_task(conn, task_id).status == "ready"
+
+
 def test_registered_adapter_reaches_the_standard_dispatch_claim_path(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(policy, "_runtime_provider", None)
     policy.register_runtime_provider(_runtime)
@@ -184,6 +197,28 @@ def test_predicate_and_approval_floor_require_current_runtime_evidence(conn, tmp
 
     assert kb.claim_task(conn, task_id, runtime_policy_provider=wrong_floor) is None
     assert _latest_event(conn, task_id, "claim_rejected").payload["code"] == "approval_floor_mismatch"
+
+
+def test_evaluator_rejects_malformed_contract_without_raising(tmp_path):
+    task = {**_contract(tmp_path), "task_id": "task-1"}
+    runtime = _runtime(task)
+    malformed = dict(task)
+    malformed.pop("capabilities")
+    runtime["dispatcher_tasks"][0].pop("capabilities")
+
+    result = policy.evaluate(malformed, runtime)
+    assert result["decision"] == "deny"
+    assert result["code"] == "invalid_admission_policy"
+
+
+def test_evaluator_requires_explicit_in_flight_count_for_target_seat(tmp_path):
+    task = {**_contract(tmp_path), "task_id": "task-1"}
+    runtime = _runtime(task)
+    runtime["in_flight_by_seat"] = {}
+
+    result = policy.evaluate(task, runtime)
+    assert result["decision"] == "deny"
+    assert result["code"] == "unknown_in_flight"
 
 
 def test_atomic_claim_rechecks_seat_and_write_set_in_canonical_db(conn, tmp_path):
@@ -335,6 +370,7 @@ def test_migration_recovers_creation_policy_from_review_event(conn, tmp_path):
     assert kb.request_review(conn, task_id, reviewer="verifier-1") is True
 
     # Simulate a governed row written before creation_admission_policy existed.
+    conn.execute("DROP TRIGGER trg_creation_admission_policy_immutable")
     conn.execute(
         "UPDATE tasks SET creation_admission_policy = NULL WHERE id = ?", (task_id,),
     )
@@ -344,6 +380,15 @@ def test_migration_recovers_creation_policy_from_review_event(conn, tmp_path):
     assert migrated.admission_policy["role"] == "verifier"
     assert migrated.creation_admission_policy == contract
     assert _create_governed(conn, contract, idempotency_key=key) == task_id
+
+
+def test_creation_policy_is_immutable_after_insert(conn, tmp_path):
+    task_id = _create_governed(conn, _contract(tmp_path))
+
+    with pytest.raises(sqlite3.IntegrityError, match="creation admission policy is immutable"):
+        conn.execute(
+            "UPDATE tasks SET creation_admission_policy = NULL WHERE id = ?", (task_id,),
+        )
 
 
 def test_delegation_policy_binds_to_canonical_creator_and_verifier(conn, tmp_path):
@@ -407,6 +452,24 @@ def test_failed_verification_cannot_complete_or_release_dependents(conn, tmp_pat
     assert _latest_event(conn, child, "completion_rejected").payload["reason"] == "verification_failed"
 
 
+@pytest.mark.parametrize("active_policy", [None, ""])
+def test_creation_policy_marker_prevents_receipt_bypass(
+    conn, tmp_path, active_policy,
+):
+    parent = kb.create_task(conn, title="parent")
+    child = _create_governed(
+        conn, _contract(tmp_path, parent_task_id=parent), title="child",
+    )
+    conn.execute(
+        "UPDATE tasks SET admission_policy = ? WHERE id = ?", (active_policy, child),
+    )
+
+    assert kb.complete_task(conn, child) is False
+    rejected = _latest_event(conn, child, "completion_rejected")
+    assert rejected.payload["reason"] == "delegation_receipt"
+    assert kb.get_task(conn, child).status == "ready"
+
+
 def test_rollback_requires_drain_and_persistent_trigger_fences_old_claim_sql(conn, tmp_path):
     ready = _create_governed(conn, _contract(tmp_path), title="ready")
     with pytest.raises(sqlite3.IntegrityError, match="fresh admission lease"):
@@ -431,3 +494,19 @@ def test_rollback_requires_drain_and_persistent_trigger_fences_old_claim_sql(con
     assert _latest_event(conn, ready, "rollback_fenced").payload == {
         "reason": "governed_runtime_rollback",
     }
+
+
+def test_creation_policy_marker_survives_active_policy_loss_for_rollback(conn, tmp_path):
+    task_id = _create_governed(conn, _contract(tmp_path), title="marker only")
+    conn.execute(
+        "UPDATE tasks SET admission_policy = NULL WHERE id = ?", (task_id,),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="fresh admission lease"):
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'old-code' "
+            "WHERE id = ? AND status = 'ready'", (task_id,),
+        )
+
+    assert policy.prepare_policy_rollback(conn) == [task_id]
+    assert kb.get_task(conn, task_id).status == "blocked"

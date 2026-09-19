@@ -961,6 +961,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _backfill_creation_admission_policy(conn)
 
+    # Once recorded, the producer contract is the create-idempotency identity.
+    # Backfill is allowed to populate a legacy NULL, but no later lifecycle or
+    # older writer may erase or rewrite a task's original governed request.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_creation_admission_policy_immutable
+        BEFORE UPDATE OF creation_admission_policy ON tasks
+        WHEN OLD.creation_admission_policy IS NOT NULL
+         AND NEW.creation_admission_policy IS NOT OLD.creation_admission_policy
+        BEGIN
+            SELECT RAISE(ABORT, 'creation admission policy is immutable');
+        END
+        """
+    )
+
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
@@ -980,6 +995,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         WHEN OLD.status IN ('ready', 'review')
          AND NEW.status = 'running'
          AND NEW.admission_policy IS NOT NULL
+         AND (NEW.admission_lease IS NULL OR NEW.admission_lease = OLD.admission_lease)
+        BEGIN
+            SELECT RAISE(ABORT, 'governed claim requires a fresh admission lease');
+        END
+        """
+    )
+    # ``creation_admission_policy`` is the durable governed marker.  Keep this
+    # as a second trigger so upgrading an existing DB never drops the original
+    # rollback fence, even briefly, while extending it to corrupted/missing
+    # active policy rows.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_creation_governed_claim_requires_lease
+        BEFORE UPDATE OF status ON tasks
+        WHEN OLD.status IN ('ready', 'review')
+         AND NEW.status = 'running'
+         AND NEW.creation_admission_policy IS NOT NULL
          AND (NEW.admission_lease IS NULL OR NEW.admission_lease = OLD.admission_lease)
         BEGIN
             SELECT RAISE(ABORT, 'governed claim requires a fresh admission lease');
