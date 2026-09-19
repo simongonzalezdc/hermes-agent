@@ -182,6 +182,44 @@ def derive_review_contract(value: Any, reviewer: str) -> dict[str, Any]:
     return validate_contract(derived)
 
 
+def _lifecycle_contracts(
+    active_value: Any, creation_value: Any,
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
+    """Validate active policy against the immutable producer contract."""
+    if creation_value is None:
+        return None, None, "governed task is missing its immutable creation_admission_policy"
+    try:
+        creation = validate_contract(
+            json.loads(creation_value) if isinstance(creation_value, str) else creation_value
+        )
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
+        return None, None, f"invalid creation_admission_policy: {exc}"
+    if creation["queue_lane"] != "ready" or creation["role"] == "verifier":
+        return None, creation, "creation_admission_policy is not a producer ready-lane contract"
+    if active_value is None:
+        return None, creation, "governed task is missing its active admission_policy"
+    try:
+        active = validate_contract(
+            json.loads(active_value) if isinstance(active_value, str) else active_value
+        )
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
+        return None, creation, f"invalid admission_policy: {exc}"
+    if active == creation:
+        return active, creation, None
+    try:
+        expected_review = derive_review_contract(creation, active["seat"])
+    except ValueError:
+        expected_review = None
+    if active != expected_review:
+        return (
+            active,
+            creation,
+            "active admission_policy is neither the immutable producer contract "
+            "nor its canonical verifier contract",
+        )
+    return active, creation, None
+
+
 def _decoded_capabilities(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -366,16 +404,14 @@ def assess_claim(
     ).fetchone()
     if row is None:
         return None
-    raw = row["admission_policy"]
-    if raw is None and row["creation_admission_policy"] is None:
+    active_raw = row["admission_policy"]
+    creation_raw = row["creation_admission_policy"]
+    if active_raw is None and creation_raw is None:
         return None
-    if raw is None:
-        return _deny("invalid_admission_policy", "governed task is missing its active admission_policy")
-    try:
-        task = json.loads(raw)
-        task = validate_contract(task)
-    except (TypeError, json.JSONDecodeError, ValueError) as exc:
-        return _deny("invalid_admission_policy", str(exc))
+    task, _, lifecycle_error = _lifecycle_contracts(active_raw, creation_raw)
+    if lifecycle_error:
+        return _deny("invalid_admission_policy", lifecycle_error)
+    assert task is not None
     binding_error = canonical_binding_error(task, row)
     if binding_error:
         return _deny("canonical_task_mismatch", binding_error)
@@ -397,15 +433,19 @@ def assess_claim(
     if isinstance(scope, str):
         return _deny("invalid_write_scope", scope)
     for active in conn.execute(
-        "SELECT id, admission_policy FROM tasks "
+        "SELECT id, admission_policy, creation_admission_policy FROM tasks "
         "WHERE status = 'running' AND id != ? "
         "AND (admission_policy IS NOT NULL OR creation_admission_policy IS NOT NULL)",
         (task_id,),
     ):
-        try:
-            other = validate_contract(json.loads(active["admission_policy"]))
-        except (TypeError, json.JSONDecodeError, ValueError):
-            return _deny("invalid_active_admission_policy", f"running task {active['id']} has invalid policy")
+        other, _, lifecycle_error = _lifecycle_contracts(
+            active["admission_policy"], active["creation_admission_policy"],
+        )
+        if lifecycle_error or other is None:
+            return _deny(
+                "invalid_active_admission_policy",
+                f"running task {active['id']} has invalid policy: {lifecycle_error}",
+            )
         if other["seat"] == task["seat"]:
             return _deny("seat_already_in_flight", "seat already has a canonical running task")
         other_scope = _normalized_scope(other["workspace"], other["write_set"])
@@ -468,23 +508,21 @@ def validate_completion_receipt(
     ).fetchone()
     if row is None:
         return []
-    raw = row["admission_policy"]
-    if raw is None and row["creation_admission_policy"] is None:
+    active_raw = row["admission_policy"]
+    creation_raw = row["creation_admission_policy"]
+    if active_raw is None and creation_raw is None:
         return []
-    if raw is None:
-        return ["governed task is missing its active admission_policy"]
-    try:
-        contract = validate_contract(json.loads(raw))
-    except (TypeError, json.JSONDecodeError, ValueError) as exc:
-        return [f"invalid admission_policy: {exc}"]
-    parent_id = contract.get("parent_task_id")
+    active, creation, lifecycle_error = _lifecycle_contracts(active_raw, creation_raw)
+    if lifecycle_error or active is None or creation is None:
+        return [lifecycle_error or "governed task lifecycle policy is invalid"]
+    parent_id = creation.get("parent_task_id")
+    if row["creator_task_id"] != parent_id:
+        return ["creation_admission_policy.parent_task_id does not match canonical delegation lineage"]
     if parent_id is None:
         return []
-    if row["creator_task_id"] != parent_id:
-        return ["admission_policy.parent_task_id does not match canonical delegation lineage"]
     if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (parent_id,)).fetchone() is None:
         return ["canonical parent task does not exist"]
-    verifier_identity = contract.get("verifier_identity")
+    verifier_identity = creation.get("verifier_identity")
     if not _nonempty(verifier_identity):
         return ["delegated task requires a verifier identity"]
     run = conn.execute(
@@ -492,8 +530,8 @@ def validate_completion_receipt(
         (row["current_run_id"], task_id),
     ).fetchone()
     if (
-        contract.get("role") != "verifier"
-        or contract.get("queue_lane") != "review"
+        active.get("role") != "verifier"
+        or active.get("queue_lane") != "review"
         or run is None
         or run["profile"] != verifier_identity
         or run["status"] != "running"
@@ -508,8 +546,8 @@ def validate_completion_receipt(
     expected = {
         "parent_task_id": parent_id,
         "child_task_id": task_id,
-        "workspace": contract["workspace"],
-        "write_set": contract["write_set"],
+        "workspace": creation["workspace"],
+        "write_set": creation["write_set"],
     }
     for key, value in expected.items():
         if receipt.get(key) != value:

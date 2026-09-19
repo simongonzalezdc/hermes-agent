@@ -452,6 +452,27 @@ def test_failed_verification_cannot_complete_or_release_dependents(conn, tmp_pat
     assert _latest_event(conn, child, "completion_rejected").payload["reason"] == "verification_failed"
 
 
+def test_valid_active_policy_cannot_strip_immutable_delegation_obligation(conn, tmp_path):
+    parent = kb.create_task(conn, title="parent")
+    creation_policy = _contract(tmp_path, parent_task_id=parent)
+    child = _create_governed(conn, creation_policy, title="delegated child")
+    stripped_policy = {
+        **creation_policy,
+        "parent_task_id": None,
+        "verifier_identity": None,
+    }
+    conn.execute(
+        "UPDATE tasks SET admission_policy = ? WHERE id = ?",
+        (json.dumps(stripped_policy), child),
+    )
+
+    assert kb.complete_task(conn, child) is False
+    rejected = _latest_event(conn, child, "completion_rejected")
+    assert rejected.payload["reason"] == "delegation_receipt"
+    assert any("immutable producer contract" in error for error in rejected.payload["errors"])
+    assert kb.get_task(conn, child).status == "ready"
+
+
 @pytest.mark.parametrize("active_policy", [None, ""])
 def test_creation_policy_marker_prevents_receipt_bypass(
     conn, tmp_path, active_policy,
@@ -468,6 +489,25 @@ def test_creation_policy_marker_prevents_receipt_bypass(
     rejected = _latest_event(conn, child, "completion_rejected")
     assert rejected.payload["reason"] == "delegation_receipt"
     assert kb.get_task(conn, child).status == "ready"
+
+
+def test_valid_active_write_set_mutation_cannot_hide_running_overlap(conn, tmp_path):
+    first_contract = _contract(tmp_path, seat="builder-a", write_set=["src"])
+    first = _create_governed(conn, first_contract, title="first")
+    assert kb.claim_task(conn, first, runtime_policy_provider=_runtime) is not None
+    conn.execute(
+        "UPDATE tasks SET admission_policy = ? WHERE id = ?",
+        (json.dumps({**first_contract, "write_set": ["docs"]}), first),
+    )
+
+    second_contract = _contract(
+        tmp_path, seat="builder-b", write_set=["src/module.py"],
+    )
+    second = _create_governed(conn, second_contract, title="second")
+    assert kb.claim_task(conn, second, runtime_policy_provider=_runtime) is None
+    rejected = _latest_event(conn, second, "claim_rejected")
+    assert rejected.payload["code"] == "invalid_active_admission_policy"
+    assert kb.get_task(conn, second).status == "ready"
 
 
 def test_rollback_requires_drain_and_persistent_trigger_fences_old_claim_sql(conn, tmp_path):
