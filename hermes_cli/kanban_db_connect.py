@@ -831,6 +831,10 @@ _LATER_TASK_COLUMNS = (
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
+    ("admission_policy", "admission_policy TEXT"),
+    ("admission_lease", "admission_lease TEXT"),
+    ("capabilities", "capabilities TEXT"),
+    ("creator_task_id", "creator_task_id TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
@@ -902,6 +906,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    # This trigger survives a code rollback.  A release predating governed
+    # claims cannot mint a fresh admission lease, so it cannot silently treat
+    # a governed ready/review row as legacy work.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_governed_claim_requires_lease
+        BEFORE UPDATE OF status ON tasks
+        WHEN OLD.status IN ('ready', 'review')
+         AND NEW.status = 'running'
+         AND NEW.admission_policy IS NOT NULL
+         AND (NEW.admission_lease IS NULL OR NEW.admission_lease = OLD.admission_lease)
+        BEGIN
+            SELECT RAISE(ABORT, 'governed claim requires a fresh admission lease');
+        END
+        """
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).

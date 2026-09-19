@@ -732,12 +732,20 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    admission_policy: Optional[dict] = None  # immutable dispatcher binding; NULL = legacy behaviour
+    capabilities: Optional[list] = None      # governed worker toolsets; NULL = profile defaults
+    creator_task_id: Optional[str] = None    # durable delegation lineage
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _lossy_text(_row_get(row, col, default))  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_capabilities = _json_or(g("capabilities"))
+        capabilities_value = (
+            [str(s) for s in parsed_capabilities if s]
+            if isinstance(parsed_capabilities, list) else None
+        )
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -747,6 +755,8 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            capabilities=capabilities_value,
+            admission_policy=_json_or(g("admission_policy")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -761,7 +771,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "creator_task_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1246,6 +1256,56 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _normalize_task_capabilities(capabilities: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Normalize governed per-task toolsets consumed by worker dispatch."""
+    if capabilities is None:
+        return None
+    if isinstance(capabilities, str):
+        raise ValueError("capabilities must be an iterable of toolset names, not a string")
+    cleaned = list(dict.fromkeys(str(item).strip() for item in capabilities if str(item).strip()))
+    if not cleaned:
+        raise ValueError("capabilities must contain at least one toolset")
+    unknown = sorted(item for item in cleaned if item.casefold() not in KNOWN_TOOLSET_NAMES)
+    if unknown:
+        raise ValueError("unknown task capabilities: " + ", ".join(unknown))
+    return cleaned
+
+
+def _matching_idempotent_task(
+    conn: sqlite3.Connection,
+    idempotency_key: Optional[str],
+    admission_policy: Optional[dict],
+) -> Optional[str]:
+    """Return an exact governed retry or reject a policy downgrade/mismatch."""
+    if not idempotency_key:
+        return None
+    row = conn.execute(
+        "SELECT id, admission_policy, assignee, workspace_path, capabilities, "
+        "model_override, provider_override FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    existing_raw = row["admission_policy"]
+    if existing_raw is None and admission_policy is None:
+        return row["id"]
+    if existing_raw is None or admission_policy is None:
+        raise ValueError("idempotency key policy mismatch: governed and legacy tasks cannot alias")
+    from hermes_cli.kanban_runtime_policy import canonical_binding_error, validate_contract
+
+    try:
+        existing = validate_contract(json.loads(existing_raw))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("idempotency key resolves to an invalid governed task") from exc
+    if existing != admission_policy:
+        raise ValueError("idempotency key admission_policy mismatch")
+    binding_error = canonical_binding_error(existing, row)
+    if binding_error:
+        raise ValueError("idempotency key canonical binding mismatch: " + binding_error)
+    return row["id"]
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1253,6 +1313,7 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    capabilities: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1260,6 +1321,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    admission_policy: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1280,6 +1342,10 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    if admission_policy is not None:
+        from hermes_cli.kanban_runtime_policy import validate_contract as validate_admission_policy
+
+        admission_policy = validate_admission_policy(admission_policy)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1313,19 +1379,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
-    now = int(time.time())
+    capabilities_list = _normalize_task_capabilities(capabilities)
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1334,6 +1388,34 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    if admission_policy is not None:
+        from hermes_cli.kanban_runtime_policy import canonical_binding_error
+
+        if admission_policy["queue_lane"] != "ready" or admission_policy["role"] == "verifier":
+            raise ValueError("new governed tasks must start with a producer ready-lane policy")
+        if capabilities_list is None:
+            capabilities_list = list(admission_policy["capabilities"])
+        canonical = {
+            "assignee": assignee,
+            "workspace_path": workspace_path,
+            "capabilities": capabilities_list,
+            "model_override": model_override,
+            "provider_override": provider_override,
+        }
+        binding_error = canonical_binding_error(admission_policy, canonical)
+        if binding_error:
+            raise ValueError("admission policy canonical binding mismatch: " + binding_error)
+        if admission_policy.get("parent_task_id") != creator_task_id:
+            raise ValueError("admission_policy.parent_task_id must match creator_task_id")
+
+    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
+    # race is re-checked under BEGIN IMMEDIATE below for governed cards.
+    existing_id = _matching_idempotent_task(conn, idempotency_key, admission_policy)
+    if existing_id:
+        return existing_id
+
+    now = int(time.time())
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -1341,7 +1423,15 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                existing_id = _matching_idempotent_task(conn, idempotency_key, admission_policy)
+                if existing_id:
+                    return existing_id
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                if admission_policy is not None and creator_task_id is not None:
+                    if conn.execute(
+                        "SELECT 1 FROM tasks WHERE id = ?", (creator_task_id,),
+                    ).fetchone() is None:
+                        raise ValueError("unknown creator_task_id for governed delegation")
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1357,10 +1447,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, capabilities, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        admission_policy, creator_task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1368,8 +1459,11 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(capabilities_list) if capabilities_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        json.dumps(admission_policy, sort_keys=True) if admission_policy is not None else None,
+                        creator_task_id,
                     ),
                 )
                 for pid in parents:
@@ -1392,6 +1486,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "governed": True if admission_policy is not None else None,
                     },
                 )
                 if task_status == "blocked":
@@ -2214,7 +2309,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, admission_lease: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
@@ -2224,12 +2319,13 @@ def _claim_and_open_run(
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
+               admission_lease = ?,
                started_at    = COALESCE(started_at, ?)
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
         """,
-        (lock, expires, now, task_id),
+        (lock, expires, admission_lease, now, task_id),
     )
     if cur.rowcount != 1:
         return None
@@ -2261,7 +2357,7 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, runtime_policy_provider=None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2272,6 +2368,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_runtime_policy import assess_claim
+
+        assessment = assess_claim(conn, task_id, "ready", runtime_policy_provider)
+        if assessment is not None and assessment.get("decision") != "allow":
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "runtime_policy", "code": assessment.get("code"), "detail": assessment.get("detail")},
+            )
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2286,7 +2391,15 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        event_extra = None if assessment is None else {
+            "runtime_policy": assessment.get("code"),
+            "approval": assessment.get("approval"),
+            "engine_lane": assessment.get("engine_lane"),
+        }
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now, event_extra=event_extra,
+            admission_lease=secrets.token_urlsafe(24) if assessment is not None else None,
+        )
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2296,7 +2409,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, runtime_policy_provider=None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2305,6 +2418,15 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_runtime_policy import assess_claim
+
+        assessment = assess_claim(conn, task_id, "review", runtime_policy_provider)
+        if assessment is not None and assessment.get("decision") != "allow":
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "runtime_policy", "code": assessment.get("code"), "detail": assessment.get("detail")},
+            )
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2316,8 +2438,16 @@ def claim_review_task(
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
             return None
+        event_extra = {"source_status": "review"}
+        if assessment is not None:
+            event_extra.update({
+                "runtime_policy": assessment.get("code"),
+                "approval": assessment.get("approval"),
+                "engine_lane": assessment.get("engine_lane"),
+            })
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now, event_extra=event_extra,
+            admission_lease=secrets.token_urlsafe(24) if assessment is not None else None,
         )
         if run_id is None:
             return None
@@ -2743,6 +2873,21 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        from hermes_cli.kanban_runtime_policy import validate_completion_receipt
+
+        receipt_errors = validate_completion_receipt(conn, task_id, metadata)
+        if receipt_errors:
+            _append_event(
+                conn, task_id, "completion_rejected",
+                {
+                    "reason": (
+                        "verification_failed" if "verification_failed" in receipt_errors
+                        else "delegation_receipt"
+                    ),
+                    "errors": receipt_errors,
+                },
+            )
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -3266,7 +3411,8 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, admission_policy, workspace_path, capabilities, "
+                "model_override, provider_override FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
@@ -3289,10 +3435,34 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            producer_policy = _json_or(trow["admission_policy"])
+            review_policy = None
+            if producer_policy is not None:
+                from hermes_cli.kanban_runtime_policy import (
+                    canonical_binding_error, derive_review_contract,
+                )
+
+                try:
+                    review_policy = derive_review_contract(producer_policy, reviewer or "")
+                except ValueError as exc:
+                    return _ret(False, str(exc))
+                future_row = {
+                    "assignee": reviewer,
+                    "workspace_path": trow["workspace_path"],
+                    "capabilities": trow["capabilities"],
+                    "model_override": trow["model_override"],
+                    "provider_override": trow["provider_override"],
+                }
+                binding_error = canonical_binding_error(review_policy, future_row)
+                if binding_error:
+                    return _ret(False, binding_error)
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            policy_sql = ", admission_policy = ?" if review_policy is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
+                *(() if reviewer is None else (reviewer,)),
+                *(() if review_policy is None else (json.dumps(review_policy, sort_keys=True),)),
+                task_id,
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
             cur = conn.execute(
@@ -3302,7 +3472,7 @@ def request_review(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL
-                """ + assignee_sql + """
+                """ + assignee_sql + policy_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + run_guard,
@@ -3325,6 +3495,7 @@ def request_review(
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "producer_admission_policy": producer_policy,
             }
             staged = _cleaned_artifact_paths(metadata)
             if staged:
@@ -3369,7 +3540,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, current_run_id, admission_policy, workspace_path, "
+            "capabilities, model_override, provider_override FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if task_row is None:
             return False, "task not found"
@@ -3387,14 +3559,34 @@ def request_changes(
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
             return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        requested_payload = _json_dict(requested_event["payload"])
+        implementer = _nonblank_str(requested_payload.get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        restored_policy = None
+        if task_row["admission_policy"] is not None:
+            from hermes_cli.kanban_runtime_policy import canonical_binding_error, validate_contract
+
+            try:
+                restored_policy = validate_contract(requested_payload.get("producer_admission_policy"))
+            except ValueError:
+                return False, "review handoff has no valid producer admission policy"
+            future_row = {
+                "assignee": implementer,
+                "workspace_path": task_row["workspace_path"],
+                "capabilities": task_row["capabilities"],
+                "model_override": task_row["model_override"],
+                "provider_override": task_row["provider_override"],
+            }
+            binding_error = canonical_binding_error(restored_policy, future_row)
+            if binding_error:
+                return False, binding_error
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
+        policy_sql = ", admission_policy = ?" if restored_policy is not None else ""
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3403,9 +3595,14 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
+            """ + policy_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (
+                new_status, implementer,
+                *(() if restored_policy is None else (json.dumps(restored_policy, sort_keys=True),)),
+                task_id, int(current_run_id),
+            ),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
