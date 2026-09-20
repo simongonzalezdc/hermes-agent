@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from types import SimpleNamespace
+from pathlib import Path
 
 from agent import secret_scope as ss
 from gateway import kanban_watchers_dispatcher as kwd
@@ -47,3 +48,33 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
     assert decomposed == 1
     assert seen["value"] == "launch-profile-key"
     assert ss.current_secret_scope() is None
+
+
+def test_embedded_dispatcher_passes_fixed_owner_snapshot_reader(monkeypatch, tmp_path):
+    captured = {}
+
+    class Connection:
+        def close(self):
+            captured["closed"] = True
+
+    fake_connect = SimpleNamespace(connect=lambda **kwargs: Connection())
+
+    def dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return "tick"
+
+    fake_dispatch = SimpleNamespace(dispatch_once=dispatch_once)
+    kb = SimpleNamespace(
+        DEFAULT_BOARD="default", kanban_db_path=lambda slug: Path(tmp_path / f"{slug}.db"),
+    )
+    dispatcher = kwd._KanbanDispatcher(
+        kb, kwd._DispatcherSettings(60.0, None, None, 2, 0, True, None, None),
+    )
+    monkeypatch.setattr(kwd, "_kbc", lambda: fake_connect)
+    monkeypatch.setattr(kwd, "_kbd", lambda: fake_dispatch)
+
+    assert dispatcher.tick_once_for_board("default") == "tick"
+    from hermes_cli.kanban_runtime_owner_snapshot import read_owner_snapshot
+    assert captured["runtime_policy_provider"] is read_owner_snapshot
+    assert captured["board"] == "default"
+    assert captured["closed"] is True

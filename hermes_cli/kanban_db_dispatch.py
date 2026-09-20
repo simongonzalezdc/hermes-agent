@@ -2690,6 +2690,65 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return cmd
 
 
+def _assert_governed_worker_binding(
+    task: Task, hermes_home: Optional[str], command: list[str],
+) -> None:
+    """Refuse a governed spawn unless its child runtime is exactly pinned.
+
+    The admission policy is the immutable authority.  The model and provider
+    must each appear once in argv, the assigned profile must explicitly set
+    its required approval floor, and its effective automatic fallback chain
+    must be empty.  Legacy tasks keep their existing spawn behavior.
+    """
+    if task.admission_policy is None:
+        return
+
+    from hermes_cli.kanban_runtime_policy import ROLE_FLOORS, validate_contract
+
+    contract = validate_contract(task.admission_policy)
+    model = contract.get("model_override")
+    provider = contract.get("provider_override")
+    if not model or not provider:
+        raise RuntimeError("governed worker requires explicit model and provider bindings")
+    if task.model_override != model or task.provider_override != provider:
+        raise RuntimeError("governed worker model/provider differs from its admission policy")
+    if (
+        command.count("-m") != 1
+        or command[command.index("-m") + 1] != model
+        or command.count("--provider") != 1
+        or command[command.index("--provider") + 1] != provider
+    ):
+        raise RuntimeError("governed worker argv is not exactly model/provider bound")
+    if not hermes_home:
+        raise RuntimeError("governed worker requires a resolved assignee profile")
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config, read_raw_config
+    from hermes_cli.fallback_config import get_fallback_chain
+    from tools.approval_context import _normalize_approval_mode
+
+    token = set_hermes_home_override(hermes_home)
+    try:
+        raw = read_raw_config()
+        effective = load_config()
+    finally:
+        reset_hermes_home_override(token)
+
+    raw_approvals = raw.get("approvals") if isinstance(raw, dict) else None
+    raw_mode = raw_approvals.get("mode") if isinstance(raw_approvals, dict) else None
+    effective_approvals = effective.get("approvals") if isinstance(effective, dict) else None
+    effective_mode = (
+        effective_approvals.get("mode") if isinstance(effective_approvals, dict) else None
+    )
+    expected_mode = ROLE_FLOORS[contract["role"]]["hermes_mode"]
+    if raw_mode is None or _normalize_approval_mode(raw_mode) != expected_mode:
+        raise RuntimeError("governed worker profile lacks its explicit approval binding")
+    if _normalize_approval_mode(effective_mode) != expected_mode:
+        raise RuntimeError("governed worker effective approval mode differs from its policy")
+    if get_fallback_chain(effective):
+        raise RuntimeError("governed worker automatic fallback chain must be empty")
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
@@ -2806,6 +2865,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    # Governed workers derive approval behavior from their authenticated role
+    # binding.  Never let a dispatcher's ambient YOLO session override it.
+    if task.admission_policy is not None:
+        env.pop("HERMES_YOLO_MODE", None)
     # TERMINAL_CWD takes precedence over process cwd in file_tools and
     # build_context_files_prompt; without it relative writes land in the gateway
     # user's home and workers load the gateway's AGENTS.md. file_tools rejects
@@ -2854,6 +2917,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    _assert_governed_worker_binding(task, env.get("HERMES_HOME"), cmd)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2906,6 +2970,7 @@ def run_daemon(
     daemon must not be the one uncapped entry point.
     """
     import threading
+    from hermes_cli.kanban_runtime_owner_snapshot import read_owner_snapshot
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -2933,6 +2998,7 @@ def run_daemon(
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    runtime_policy_provider=read_owner_snapshot,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

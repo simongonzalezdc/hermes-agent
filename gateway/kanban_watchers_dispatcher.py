@@ -183,10 +183,14 @@ class _KanbanDispatcher:
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
         try:
+            from hermes_cli.kanban_runtime_owner_snapshot import read_owner_snapshot
+
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            return _kbd().dispatch_once(
+                conn, board=slug, runtime_policy_provider=read_owner_snapshot, **kwargs,
+            )
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

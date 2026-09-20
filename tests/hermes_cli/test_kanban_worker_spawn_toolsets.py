@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -134,6 +136,108 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
     assert args.query == "work kanban task t_spawn_tools"
+
+
+def _governed_task(kb, workspace, *, approval="manual"):
+    task = _make_task(kb, assignee="elias")
+    task.workspace_path = str(workspace)
+    task.capabilities = ["terminal"]
+    task.model_override = "model-a"
+    task.provider_override = "provider-a"
+    task.admission_policy = {
+        "seat": "elias",
+        "role": "seat",
+        "queue_lane": "ready",
+        "target_channel": "engineering",
+        "predicate": {"kind": "command", "value": "pytest -q"},
+        "workspace": str(workspace),
+        "write_set": ["src"],
+        "capabilities": ["terminal"],
+        "model_override": "model-a",
+        "provider_override": "provider-a",
+        "parent_task_id": None,
+        "verifier_identity": None,
+    }
+    return task
+
+
+def _write_governed_profile(tmp_path, *, approval="manual", fallback=False):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    fallback_yaml = (
+        "fallback_providers:\n  - provider: backup\n    model: backup-model\n"
+        if fallback else "fallback_providers: []\n"
+    )
+    profile.joinpath("config.yaml").write_text(
+        f"approvals:\n  mode: {approval}\n{fallback_yaml}", encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    return root
+
+
+def test_governed_spawn_exactly_binds_model_provider_approval_and_no_fallback(
+    monkeypatch, tmp_path,
+):
+    root = _write_governed_profile(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kbd._default_spawn(_governed_task(kb, workspace), str(workspace)) == 4245
+    assert captured["cmd"].count("-m") == 1
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "model-a"
+    assert captured["cmd"].count("--provider") == 1
+    assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "provider-a"
+    assert "HERMES_YOLO_MODE" not in captured["env"]
+
+
+@pytest.mark.parametrize(
+    ("approval", "fallback", "message"),
+    [
+        ("smart", False, "approval binding"),
+        ("manual", True, "fallback chain"),
+    ],
+)
+def test_governed_spawn_refuses_profile_binding_drift(
+    monkeypatch, tmp_path, approval, fallback, message,
+):
+    root = _write_governed_profile(tmp_path, approval=approval, fallback=fallback)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    popen_called = False
+
+    def fake_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("Popen must not be reached")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match=message):
+        kbd._default_spawn(_governed_task(kb, workspace), str(workspace))
+    assert popen_called is False
 
 
 def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):

@@ -83,6 +83,8 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 3
+    from hermes_cli.kanban_runtime_owner_snapshot import read_owner_snapshot
+    assert captured.get("runtime_policy_provider") is read_owner_snapshot
 
 
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
