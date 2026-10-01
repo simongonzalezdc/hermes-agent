@@ -6,6 +6,7 @@ to download, cache, and optionally inject text from non-image/audio files.
 """
 
 import os
+import socket
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -91,6 +92,18 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
+
+
+@pytest.fixture(autouse=True)
+def _attachment_dns(monkeypatch):
+    """Keep the real SSRF check, with deterministic DNS for the mocked CDN."""
+    def resolve(host, port, *args, **kwargs):
+        if host != "cdn.discordapp.com":
+            raise socket.gaierror("Unexpected DNS lookup in a document unit test")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("tools.url_safety.socket.getaddrinfo", resolve)
 
 
 @pytest.fixture
@@ -528,4 +541,3 @@ class TestAllowAnyAttachment:
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
-

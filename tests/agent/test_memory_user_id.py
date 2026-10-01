@@ -317,11 +317,15 @@ class TestHonchoUserIdScoping:
         mock_cfg.base_url = None
         mock_cfg.peer_name = "my-custom-peer"
         mock_cfg.recall_mode = "tools"
+        mock_cfg.init_on_session_start = False
 
         with patch(
             "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
             return_value=mock_cfg,
-        ):
+        ), patch(
+            "plugins.memory.honcho.client.get_honcho_client",
+            side_effect=AssertionError("Tools-only initialization must remain lazy"),
+        ) as client_factory:
             provider.initialize(
                 session_id="test-sess",
                 platform="cli",
@@ -329,6 +333,7 @@ class TestHonchoUserIdScoping:
 
         # peer_name should not have been overridden
         assert mock_cfg.peer_name == "my-custom-peer"
+        client_factory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -355,4 +360,3 @@ class TestAIAgentUserIdPropagation:
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
-
