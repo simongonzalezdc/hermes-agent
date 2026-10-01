@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import socket
 from typing import Any, Dict, List
 
 import pytest
@@ -233,6 +234,7 @@ class TestWebSearchUsesSearchBackend:
 
     def test_search_tool_calls_search_backend(self, monkeypatch):
         from tools import web_tools
+        from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
 
         called_with = []
         original_get_search = web_tools._get_search_backend
@@ -245,14 +247,15 @@ class TestWebSearchUsesSearchBackend:
         monkeypatch.setattr(web_tools, "_get_search_backend", tracking_get_search)
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "firecrawl"})
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
+        monkeypatch.setattr(
+            FirecrawlWebSearchProvider, "search",
+            lambda self, query, limit=5: {"success": True, "data": {"web": []}},
+        )
 
-        # The function will fail at Firecrawl client level but we just
-        # need to verify _get_search_backend was called
-        try:
-            web_tools.web_search_tool("test", 1)
-        except Exception:
-            pass
+        # Exercise real dispatch without contacting Firecrawl with a fake key.
+        result = json.loads(web_tools.web_search_tool("test", 1))
 
+        assert result["success"] is True
         assert len(called_with) > 0
         assert called_with[0][0] == "search"
 
@@ -411,6 +414,13 @@ class TestDispatchersTriggerPluginDiscovery:
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
             )
+            def resolve(host, port, *args, **kwargs):
+                if host != "example.com":
+                    raise socket.gaierror("Unexpected DNS lookup in a web unit test")
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                         ("93.184.216.34", port or 0))]
+
+            monkeypatch.setattr("tools.url_safety.socket.getaddrinfo", resolve)
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 
@@ -491,4 +501,3 @@ class TestDispatchersTriggerPluginDiscovery:
             assert web_search_registry.get_provider("brave-free") is not None
         finally:
             restore()
-
