@@ -1,0 +1,23 @@
+name: kanban-unblock
+repo: https://github.com/KyaniteLabs/kanban-unblock
+sha: 405f0d0bf48af8d8b1ce8db9bf34d9eb6148e9e9
+subdir: plugins/kanban-unblock-hermes
+description: "Kanban Unblock Pane for Hermes — answer a blocked card's question and unblock it in place, without leaving /kanban. Adds a pre_llm_call blocked-queue brief, a /kanban-unblock slash command (queue|show|reply|clarify|unblock|status|help), matching tools, a Dashboard pane and a bundled skill. Shell and code approvals are deliberately out of scope — install the needs-you plugin for those. Disclosure — uses only public Hermes surfaces through ctx.dispatch_tool (kanban_list, kanban_show, kanban_comment, kanban_unblock); does not import hermes_cli.kanban_db and never reads the kanban database directly; reply text and unblock actions are operator-driven, never autonomous; a short queue ledger is kept under <HERMES_HOME>/plugin-data/kanban-unblock/; no secrets, no child processes, no network calls, no telemetry; mutating slash commands and tools are refused on gateway platforms unless allow_mutate_on_gateway is enabled."
+maintainer: KyaniteLabs
+tier: community
+category: automation
+requires_hermes: ">=0.21.6"
+docs_url: https://github.com/KyaniteLabs/kanban-unblock/tree/main/plugins/kanban-unblock-hermes
+version: "0.1.0"
+platforms: []
+capabilities:
+  provides_tools:
+    - kanban_unblock_queue
+    - kanban_unblock_show
+    - kanban_unblock_reply
+    - kanban_unblock_clarify
+    - kanban_unblock_go
+  provides_hooks:
+    - pre_llm_call
+  provides_middleware: []
+  requires_env: []
